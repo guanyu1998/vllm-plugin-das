@@ -34,6 +34,16 @@ def make_deep_ep_ht_kwargs(manager: object, envs: object) -> dict[str, Any]:
         num_qps_per_rank = 1
         manager.num_sms = 60
 
+    import deep_ep
+
+    # Bind DeepEP's class-wide SM budget before the shared buffer is created,
+    # so HT dispatch/combine kernels launch with grid == num_sms. Without this
+    # the env override is only consumed by manager.set_num_sms(), which is
+    # never called on the plain deepep_high_throughput (non-DBO) path and the
+    # kernels stay at the deep_ep default of 24. Value must be even and a
+    # multiple of 3 (deep_ep asserts).
+    deep_ep.Buffer.set_num_sms(requested_deep_ep_sms(manager.num_sms))
+
     return {
         "group": manager.cpu_group,
         "num_nvl_bytes": envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024,
