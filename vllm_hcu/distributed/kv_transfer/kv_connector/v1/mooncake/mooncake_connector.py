@@ -9,6 +9,8 @@ import re
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable, Coroutine
+from concurrent.futures import Future as CFuture
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
@@ -143,6 +145,39 @@ def log_ttft_event(
         tid or "-",
         req_id or "-",
     )
+
+
+def _watch_bg_coroutine(fut: CFuture, what: str) -> CFuture:
+    """Make a fire-and-forget connector coroutine report its failures.
+
+    ``asyncio.run_coroutine_threadsafe()`` returns a
+    ``concurrent.futures.Future``. Unlike an asyncio Task, an exception on such
+    a future that nobody retrieves is reported *nowhere* -- not even as the
+    "Task exception was never retrieved" message asyncio prints for Tasks. Any
+    failure inside ``record_send_reqs()`` / ``_start_load_kv()`` therefore used
+    to vanish without a trace, and the only visible symptom appeared
+    VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT seconds later on the *peer* as
+    "Timeout waiting for P side ready" / "Mooncake KV receive failed".
+
+    See bug_record/BUG-002 (qwen3_8-next-flash-PD).
+    """
+
+    def _report(done: CFuture) -> None:
+        if done.cancelled():
+            return
+        exc = done.exception()
+        if exc is not None:
+            logger.error(
+                "Mooncake background coroutine %s failed; the peer will now "
+                "block until VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT expires: %r",
+                what,
+                exc,
+                exc_info=exc,
+            )
+
+    fut.add_done_callback(_report)
+    return fut
+
 
 try:
     from mooncake.engine import TransferEngine
@@ -1523,6 +1558,13 @@ class MooncakeConnectorWorker:
         self.finished_recving_reqs: set[ReqId] = set()
         self._kv_load_error: str | None = None
 
+        # In-flight get_finished() polls, kept across engine steps so a poll
+        # that times out is resumed rather than abandoned. See
+        # _submit_poll()/_collect_poll().
+        self._pending_polls: dict[str, CFuture] = {}
+        self._poll_started_at: dict[str, float] = {}
+        self._poll_stall_logged_at: dict[str, float] = {}
+
         self.xfer_stats = MooncakeKVConnectorStats()
 
         self.attn_backends = get_current_attn_backends(vllm_config)
@@ -2442,10 +2484,23 @@ class MooncakeConnectorWorker:
             return
 
         ready_event = threading.Event()
-        asyncio.run_coroutine_threadsafe(
-            self._mooncake_sender_listener(ready_event), self.sender_loop
+        listener_fut = _watch_bg_coroutine(
+            asyncio.run_coroutine_threadsafe(
+                self._mooncake_sender_listener(ready_event), self.sender_loop
+            ),
+            "_mooncake_sender_listener",
         )
-        ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+        # Wait for listener ZMQ socket to be ready. Poll instead of blocking
+        # forever: if the listener dies before signalling (e.g. the bootstrap
+        # registration raises, which happens outside its own try/except) the
+        # exception lives only on the discarded future, so an unconditional
+        # wait() would hang worker startup with no diagnostic whatsoever.
+        while not ready_event.wait(timeout=5.0):
+            if listener_fut.done():
+                cause = None if listener_fut.cancelled() else listener_fut.exception()
+                raise RuntimeError(
+                    "Mooncake sender listener exited before becoming ready"
+                ) from cause
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         if self._kv_load_error is not None:
@@ -2486,26 +2541,89 @@ class MooncakeConnectorWorker:
 
         return finished_sending_reqs
 
+    # Budget for a single get_finished() poll. fetch_finished_{recving,sending}
+    # _reqs() only swap a set and scan a small dict, so exceeding this means the
+    # connector event loop is starved, never that a transfer is slow. Blocking
+    # the engine step on it is never the right trade: on P it stops the
+    # scheduler, which stops record_send_reqs() from marking new requests ready,
+    # which makes every peer pull time out -- one stuck loop wedges the whole
+    # instance. See bug_record/BUG-002.
+    _POLL_TIMEOUT_S = 2.0
+    # Only complain once a poll has been pending this long, then every interval.
+    _POLL_STALL_LOG_INTERVAL_S = 30.0
+
+    def _submit_poll(
+        self,
+        name: str,
+        coro_factory: Callable[[], Coroutine[Any, Any, set[ReqId]]],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Submit a poll coroutine unless the previous one is still pending."""
+        if name in self._pending_polls:
+            return
+        self._pending_polls[name] = asyncio.run_coroutine_threadsafe(
+            coro_factory(), loop
+        )
+        self._poll_started_at[name] = time.perf_counter()
+
+    def _collect_poll(self, name: str) -> set[ReqId] | None:
+        """Collect a poll result, giving up for this step if it is not ready.
+
+        The pending future is deliberately *retained* across engine steps
+        instead of being dropped on timeout: fetch_finished_*_reqs() consumes
+        self.finished_*_reqs destructively, so abandoning a timed-out future
+        would silently lose completion reports and strand KV blocks on both
+        sides.
+        """
+        fut = self._pending_polls.get(name)
+        if fut is None:
+            return None
+        try:
+            result = fut.result(timeout=self._POLL_TIMEOUT_S)
+        except TimeoutError:
+            now = time.perf_counter()
+            waited = now - self._poll_started_at.get(name, now)
+            last_logged = self._poll_stall_logged_at.get(name, 0.0)
+            if waited >= self._POLL_STALL_LOG_INTERVAL_S and (
+                now - last_logged >= self._POLL_STALL_LOG_INTERVAL_S
+            ):
+                self._poll_stall_logged_at[name] = now
+                logger.warning(
+                    "Rank %s: Mooncake %s poll pending for %.1fs -- the "
+                    "connector event loop is not making progress. Engine steps "
+                    "continue, but KV completions are reported late.",
+                    self.tp_rank,
+                    name,
+                    waited,
+                )
+            return None
+        except BaseException:
+            # Completed with an error (e.g. a fatal KV load failure). Drop it so
+            # the same exception is not re-raised on every subsequent step.
+            self._pending_polls.pop(name, None)
+            self._poll_stall_logged_at.pop(name, None)
+            raise
+        self._pending_polls.pop(name, None)
+        self._poll_stall_logged_at.pop(name, None)
+        return result
+
     def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
         """
         Get requests that are done sending or recving on this specific worker.
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
-        recv_fut = None
-        send_fut = None
         if not self.is_kv_producer:
-            recv_fut = asyncio.run_coroutine_threadsafe(
-                self.fetch_finished_recving_reqs(), self.receiver_loop
+            self._submit_poll(
+                "recv", self.fetch_finished_recving_reqs, self.receiver_loop
             )
-
         if not self.is_kv_consumer:
-            send_fut = asyncio.run_coroutine_threadsafe(
-                self.fetch_finished_sending_reqs(), self.sender_loop
+            self._submit_poll(
+                "send", self.fetch_finished_sending_reqs, self.sender_loop
             )
 
-        finished_recving_reqs = recv_fut.result() if recv_fut else set()
-        finished_sending_reqs = send_fut.result() if send_fut else set()
+        finished_recving_reqs = self._collect_poll("recv") or set()
+        finished_sending_reqs = self._collect_poll("send") or set()
 
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
@@ -2783,7 +2901,26 @@ class MooncakeConnectorWorker:
                     self.finished_sending_reqs.add(p_req_id)
                     continue
                 # Already gone through request_finished()
-                send_meta = self.reqs_need_send[transfer_id]
+                send_meta = self.reqs_need_send.get(transfer_id)
+                if send_meta is None:
+                    # No pending entry, so nothing will ever be sent for this
+                    # transfer (it was dropped earlier, e.g. through
+                    # reqs_not_processed). Report it as finished-sending
+                    # anyway: otherwise the scheduler pins this request's KV
+                    # blocks forever waiting for a completion that cannot come.
+                    # Letting the KeyError fly instead would be invisible --
+                    # this runs in a fire-and-forget coroutine, see
+                    # _watch_bg_coroutine().
+                    logger.warning(
+                        "Mooncake record_send_reqs: no pending send entry for "
+                        "transfer_id=%s (req %s); freeing its blocks without "
+                        "sending. A consumer waiting on this transfer will "
+                        "report a failed KV load.",
+                        transfer_id,
+                        p_req_id,
+                    )
+                    self.finished_sending_reqs.add(p_req_id)
+                    continue
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
                 send_meta.expire_time = (
@@ -2814,15 +2951,21 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
-            asyncio.run_coroutine_threadsafe(
-                self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
+            _watch_bg_coroutine(
+                asyncio.run_coroutine_threadsafe(
+                    self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
+                ),
+                "_start_load_kv",
             )
 
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+            _watch_bg_coroutine(
+                asyncio.run_coroutine_threadsafe(
+                    self.record_send_reqs(metadata), self.sender_loop
+                ),
+                "record_send_reqs",
             )
 
     def _producer_cache_is_replicated(self) -> bool:
