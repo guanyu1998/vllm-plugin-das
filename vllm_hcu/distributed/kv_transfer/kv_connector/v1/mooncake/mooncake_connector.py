@@ -1035,9 +1035,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Get the finished recving and sending requests."""
+        """Get the finished recving and sending requests.
+
+        ``finished_req_ids`` is forwarded to the worker: it is the only signal
+        the worker gets that the engine has stopped caring about a request, and
+        a KV receive error for such a request must not be fatal. See
+        MooncakeConnectorWorker.note_finished_requests().
+        """
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        return self.connector_worker.get_finished(finished_req_ids)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1557,6 +1563,12 @@ class MooncakeConnectorWorker:
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
         self._kv_load_error: str | None = None
+
+        # d_req_id -> monotonic time at which the engine reported the request
+        # as finished/aborted. A KV receive error that arrives after that point
+        # belongs to a request nobody is waiting for any more and must not kill
+        # the worker. See note_finished_requests()/process_pulling_result().
+        self._abandoned_pull_reqs: dict[ReqId, float] = {}
 
         # In-flight get_finished() polls, kept across engine steps so a poll
         # that times out is resumed rather than abandoned. See
@@ -2607,12 +2619,64 @@ class MooncakeConnectorWorker:
         self._poll_stall_logged_at.pop(name, None)
         return result
 
-    def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
+    # Only start pruning once the map is non-trivial, and never let it exceed
+    # the hard cap (see note_finished_requests()).
+    _ABANDONED_PRUNE_AT = 1024
+    _ABANDONED_MAX = 65536
+
+    # An abandoned request is remembered for at least this long after the
+    # engine finished it, because the peer only reports a stuck transfer after
+    # VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT seconds and we must still recognise
+    # that late error as stale.
+    @property
+    def _abandoned_retention_s(self) -> float:
+        return 2.0 * envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 300.0
+
+    def note_finished_requests(self, finished_req_ids: set[ReqId]) -> None:
+        """Record requests the engine has finished or aborted.
+
+        A consumer request that is aborted while parked in
+        WAITING_FOR_REMOTE_KVS leaves its pull task alive inside the connector:
+        the producer only answers "Timeout waiting for P side ready" once
+        VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT expires, and that late error used
+        to be turned into a connector-wide fatal _kv_load_error, killing every
+        WorkerProc (BUG-002: a plain client disconnect was enough to destroy
+        the decode engine minutes later).
+        """
+        if self.is_kv_producer:
+            # Producers do not pull, so they have no late receive errors.
+            return
+        if finished_req_ids:
+            now = time.monotonic()
+            for req_id in finished_req_ids:
+                self._abandoned_pull_reqs[req_id] = now
+        if len(self._abandoned_pull_reqs) <= self._ABANDONED_PRUNE_AT:
+            return
+        cutoff = time.monotonic() - self._abandoned_retention_s
+        for req_id, noted_at in list(self._abandoned_pull_reqs.items()):
+            if noted_at < cutoff:
+                del self._abandoned_pull_reqs[req_id]
+        # Age-based pruning alone is unbounded: a busy decode node finishes
+        # thousands of requests inside the retention window. Keep a hard cap so
+        # this can never grow without limit in a long-lived server, dropping the
+        # oldest entries first (they are the least likely to still be waiting on
+        # a peer timeout).
+        overflow = len(self._abandoned_pull_reqs) - self._ABANDONED_MAX
+        if overflow > 0:
+            oldest = sorted(self._abandoned_pull_reqs.items(), key=lambda kv: kv[1])
+            for req_id, _ in oldest[:overflow]:
+                del self._abandoned_pull_reqs[req_id]
+
+    def get_finished(
+        self, finished_req_ids: set[ReqId] | None = None
+    ) -> tuple[set[str] | None, set[str] | None]:
         """
         Get requests that are done sending or recving on this specific worker.
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
+        self.note_finished_requests(finished_req_ids or set())
+
         if not self.is_kv_producer:
             self._submit_poll(
                 "recv", self.fetch_finished_recving_reqs, self.receiver_loop
@@ -2723,10 +2787,54 @@ class MooncakeConnectorWorker:
         err_reqs: list[ReqId] = response.err_reqs or []
 
         if err_reqs:
-            self._kv_load_error = (
-                f"Mooncake KV receive failed for {err_reqs}: {response.err_msg}"
-            )
-            logger.error("%s", self._kv_load_error)
+            # Only fail the worker over a request the engine is still waiting
+            # for. A receive error for an already finished/aborted request (or
+            # for an id we cannot even attribute to a local pull) says nothing
+            # about live traffic, and turning it into a connector-wide fatal
+            # error destroys the whole decode engine. See BUG-002 §13.
+            live_err_reqs: list[ReqId] = []
+            stale_err_reqs: list[ReqId] = []
+            for req_id in err_reqs:
+                pull_meta = pull_metas.get(req_id)
+                if pull_meta is None or (
+                    pull_meta.d_req_id in self._abandoned_pull_reqs
+                ):
+                    stale_err_reqs.append(req_id)
+                else:
+                    live_err_reqs.append(req_id)
+
+            if stale_err_reqs:
+                logger.warning(
+                    "Ignoring stale Mooncake KV receive error for %s: %s. The "
+                    "engine already finished or aborted these requests, so the "
+                    "failure is not propagated.",
+                    stale_err_reqs,
+                    response.err_msg,
+                )
+                for req_id in stale_err_reqs:
+                    pull_meta = pull_metas.get(req_id)
+                    if pull_meta is None or pull_meta.pull_tasks_count <= 0:
+                        continue
+                    if not any(group for group in pull_meta.local_block_ids):
+                        # A notify-and-free pull (no blocks of our own). The
+                        # scheduler already released this request, so reporting
+                        # it as finished-recving would reference a request it
+                        # has forgotten.
+                        pull_meta.pull_tasks_count = 0
+                        continue
+                    # Aborted while parked in WAITING_FOR_REMOTE_KVS: the
+                    # scheduler is holding its blocks until the connector
+                    # reports the recv as finished. Report it, or the blocks
+                    # stay pinned for the lifetime of the engine.
+                    pull_meta.pull_tasks_count = 0
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
+
+            if live_err_reqs:
+                self._kv_load_error = (
+                    f"Mooncake KV receive failed for {live_err_reqs}: "
+                    f"{response.err_msg}"
+                )
+                logger.error("%s", self._kv_load_error)
             return
 
         for req_id in dict.fromkeys((*ok_reqs, *err_reqs)):
