@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import inspect
 import os
 from contextvars import ContextVar
@@ -25,6 +26,50 @@ def enabled() -> bool:
     return os.environ.get("VLLM_HCU_MAMBA_PREFILL_CHECKPOINT", "0").lower() in (
         "1", "true", "yes", "on"
     )
+
+
+@functools.lru_cache(maxsize=1)
+def boltops_checkpoint_kernel():
+    """Load the optional standalone Triton package without building HCU."""
+    try:
+        module = importlib.import_module("boltops_gdn_kernel")
+    except ModuleNotFoundError as exc:
+        if exc.name != "boltops_gdn_kernel":
+            raise
+        return None
+    return module.chunk_gated_delta_rule_fwd_h
+
+
+@functools.lru_cache(maxsize=1)
+def aiter_checkpoint_kernel():
+    """Use the project-local native HIP extension only when it is installed."""
+    try:
+        module = importlib.import_module("aiter_kernel.ops.fla")
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not "aiter_kernel.ops.fla".startswith(exc.name):
+            raise
+        return None
+    from vllm_hcu.patch.worker.op_opt._aiter_fla import make_aiter_gdn_resolver
+    from vllm_hcu.patch.worker.op_opt._common import require_exact_signature
+
+    if make_aiter_gdn_resolver("chunk_gated_delta_rule_fwd_h")() is None:
+        return None
+    kernel = module.chunk_gated_delta_rule_fwd_vllm_hip_blockdim64
+    require_exact_signature(
+        kernel, "aiter_kernel.ops.fla.chunk_gated_delta_rule_fwd_vllm_hip_blockdim64",
+        positional=("k", "w", "u", "g", "gk", "initial_state", "initial_state_indices",
+                    "output_final_state", "chunk_size", "save_new_value", "cu_seqlens",
+                    "chunk_indices", "chunk_offsets", "use_exp2", "transpose_state_layout",
+                    "kernel_cfg", "checkpoint_state", "checkpoint_offsets", "checkpoint_state_indices",
+                    "null_state_index"),
+        defaults={"g": None, "gk": None, "initial_state": None, "initial_state_indices": None,
+                  "output_final_state": True, "chunk_size": 64, "save_new_value": True,
+                  "cu_seqlens": None, "chunk_indices": None, "chunk_offsets": None,
+                  "use_exp2": False, "transpose_state_layout": True, "kernel_cfg": None,
+                  "checkpoint_state": None, "checkpoint_offsets": None, "checkpoint_state_indices": None,
+                  "null_state_index": -1},
+    )
+    return kernel
 
 
 @dataclass
@@ -152,9 +197,19 @@ def patch_layer_spec(layer_cls, kind: str) -> None:
                 requested_prefill_backend,
             )
 
+            backend = requested_prefill_backend(config)
             return (
                 self.gdn_prefill_backend == "triton"
-                and requested_prefill_backend(config) == "triton"
+                and (backend == "triton" or (
+                    backend == "hcu-boltops" and boltops_checkpoint_kernel() is not None
+                ) or (
+                    backend == "hcu-aiter"
+                    and getattr(self, "head_k_dim", None) == 128
+                    and getattr(self, "head_v_dim", None) == 128
+                    and torch.cuda.is_available()
+                    and torch.cuda.get_device_properties().gcnArchName.split(":")[0] == "gfx936"
+                    and aiter_checkpoint_kernel() is not None
+                ))
                 and self.conv_kernel_size - 1 <= 64
             )
         return self.conv_state_len <= 64
@@ -244,7 +299,8 @@ def _store_recurrent_checkpoint(
 def checkpoint_chunk(*, checkpoint, state, q, k, v, g, beta,
                      initial_state, output_final_state, cu_seqlens=None,
                      chunk_indices=None, chunk_offsets=None,
-                     use_qk_l2norm_in_kernel=False, core_attn_out=None, scale=None):
+                     use_qk_l2norm_in_kernel=False, core_attn_out=None, scale=None,
+                     checkpoint_backend="triton"):
     from vllm.third_party.flash_linear_attention.ops import chunk as chunk_ops
     from vllm_hcu.model_executor.layers.fla_prefill_checkpoint import (
         chunk_gated_delta_rule_fwd_h,
@@ -270,18 +326,44 @@ def checkpoint_chunk(*, checkpoint, state, q, k, v, g, beta,
     )
     if tuple(state.stride()[1:]) != (state.shape[2] * state.shape[3], state.shape[3], 1):
         raise RuntimeError("Recurrent checkpoint cache rows must be contiguous")
-    snapshots = torch.empty(initial_state.shape, dtype=state.dtype, device=k.device)
-    hidden, new_values, final_state = chunk_gated_delta_rule_fwd_h(
-        k=k, w=weights, u=values, g=g, initial_state=initial_state.contiguous(),
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
-        checkpoint_state=snapshots, checkpoint_offsets=checkpoint.offsets,
-    )
-    row_size = snapshots[0].numel()
-    _store_recurrent_checkpoint[(snapshots.shape[0], triton.cdiv(row_size, 512))](
-        snapshots, state, checkpoint.offsets, checkpoint.state_indices,
-        row_size, state.stride(0), 512,
-    )
+    native = checkpoint_backend in ("hcu-boltops", "hcu-aiter")
+    direct = native and state.dtype == torch.float32
+    if native:
+        recurrence = (aiter_checkpoint_kernel() if checkpoint_backend == "hcu-aiter"
+                      else boltops_checkpoint_kernel())
+        if recurrence is None:
+            raise RuntimeError(f"Selected {checkpoint_backend} does not expose the checkpoint API")
+        snapshots = state if direct else torch.empty_like(initial_state, dtype=torch.float32)
+        extra = {}
+        if checkpoint_backend == "hcu-aiter":
+            if chunk_offsets is not None and chunk_offsets.dtype != torch.int64:
+                chunk_offsets = chunk_offsets.to(torch.int64)
+            extra["chunk_offsets"] = chunk_offsets
+        else:
+            # NULL_BLOCK_ID=0 must never be a checkpoint destination in vLLM.
+            extra["null_state_index"] = 0
+        hidden, new_values, final_state = recurrence(
+            k=k, w=weights, u=values, g=g, initial_state=initial_state.contiguous(),
+            output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices, transpose_state_layout=True,
+            checkpoint_state=snapshots, checkpoint_offsets=checkpoint.offsets,
+            checkpoint_state_indices=checkpoint.state_indices if direct else None,
+            **extra,
+        )
+    else:
+        snapshots = torch.empty(initial_state.shape, dtype=state.dtype, device=k.device)
+        hidden, new_values, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k, w=weights, u=values, g=g, initial_state=initial_state.contiguous(),
+            output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
+            checkpoint_state=snapshots, checkpoint_offsets=checkpoint.offsets,
+        )
+    if not direct:
+        row_size = snapshots[0].numel()
+        _store_recurrent_checkpoint[(snapshots.shape[0], triton.cdiv(row_size, 512))](
+            snapshots, state, checkpoint.offsets, checkpoint.state_indices,
+            row_size, state.stride(0), 512,
+        )
     output = chunk_ops.chunk_fwd_o(
         q=q, k=k, v=new_values, h=hidden, g=g,
         scale=k.shape[-1] ** -0.5 if scale is None else scale,
@@ -347,8 +429,18 @@ def patch_gdn(module) -> bool:
             checkpoint.offsets[first:], checkpoint.state_indices[first:],
             checkpoint.offsets_cpu[first:],
         )
+        from vllm_hcu.patch.worker.op_opt._gdn_backend import requested_backend
+
+        backend = requested_backend("prefill")
+        checkpoint_backend = "triton"
+        if backend == "hcu-boltops" and boltops_checkpoint_kernel() is not None:
+            checkpoint_backend = "hcu-boltops"
+        elif backend == "hcu-aiter" and aiter_checkpoint_kernel() is not None:
+            checkpoint_backend = "hcu-aiter"
         result = checkpoint_chunk(
-            checkpoint=prefill, state=context.recurrent_state, **kwargs,
+            checkpoint=prefill, state=context.recurrent_state,
+            checkpoint_backend=checkpoint_backend,
+            **kwargs,
         )
         context.exported = True
         return result

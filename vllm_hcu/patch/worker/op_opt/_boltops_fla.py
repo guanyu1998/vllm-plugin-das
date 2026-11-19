@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable
 
 from ._common import PatchCompatibilityError, require_exact_signature
@@ -127,11 +128,17 @@ def make_boltops_gdn_resolver(name: str) -> Callable[[], Callable | None]:
             raise PatchCompatibilityError(
                 f"optional {_MODULE}.{name} exists but is not callable"
             )
+        expected_positional = positional
+        expected_defaults = defaults
+        if name == "chunk_gated_delta_rule_fwd_h" and "checkpoint_state" in inspect.signature(candidate).parameters:
+            extensions = ("checkpoint_state", "checkpoint_offsets", "checkpoint_state_indices")
+            expected_positional = (*positional, *extensions)
+            expected_defaults = {**defaults, **dict.fromkeys(extensions)}
         require_exact_signature(
             candidate,
             f"{_MODULE}.{name} (audited BoltOPs {_AUDITED_VERSION})",
-            positional=positional,
-            defaults=defaults,
+            positional=expected_positional,
+            defaults=expected_defaults,
         )
         kernel = candidate
         resolved = True

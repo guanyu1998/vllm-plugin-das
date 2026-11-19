@@ -13,6 +13,7 @@ import re
 
 RECURRENT_CHECKPOINT_KERNELS = (
     "_store_recurrent_checkpoint",
+    "aiter_gdn_checkpoint_kernel",
 )
 CHECKPOINT_KERNELS = ("_store_conv_checkpoint", *RECURRENT_CHECKPOINT_KERNELS)
 

@@ -22,9 +22,26 @@ cache spec 和 block table 规划保持一致。
 
 开关默认关闭。只有所有 Mamba 层都声明支持时，GDN / PLE 的实际 cache spec
 才会声明一个额外 checkpoint block，alignment 为 64。未知 Mamba 层或超过
-64 token 的卷积 history 会让本次模型配置继续使用原有切分逻辑。
-当前 GDN 仅对 triton 后端声明这项能力；其它后端继续原切分逻辑，
-decode backend 不受该选项影响。
+64 token 的卷积 history 会让本次模型配置继续使用原有切分逻辑。没有加载项目
+checkpoint 扩展的 AITER 不声明这项能力；decode backend 不受该选项影响。
+
+2026-11-19 BoltOps checkpoint 实现已拆到独立目录：
+`/jsyadmin/guanyu/qwen3_8-next-flash-PD/boltops-gdn-kernel`。将该目录加入
+`PYTHONPATH`，选择 `--gdn-prefill-backend hcu-boltops` 并启用上述开关，插件
+会导入外置 `boltops_gdn_kernel`，使用同一 Triton 实现和 gfx936 H24/H48 配置。
+无需重编译或重新安装 HCU，首次运行只由 Triton 自动 JIT 编译并缓存。
+插件中仅保留导入入口，kernel 和配置不进入 HCU 构建或分发。
+FP32 cache 由 recurrence 直接写 slot，BF16 cache 经 FP32 snapshot 转换。
+未加载外置包时不声明 BoltOps checkpoint 能力，继续原切分逻辑。
+直接调用示例见外置目录 README.md。普通/prof/tp2dp1ep2 的 P/D 启动脚本
+已加入该搜索路径；实际生效需要启动新进程。
+原优化记录见
+`/jsyadmin/guanyu/qwen3_8-next-flash-PD/boltops-gdn-chunk-delta-h-optimizer/gdn_checkpoint/README.md`。
+
+项目 AITER HIP 扩展位于 `/jsyadmin/guanyu/qwen3_8-next-flash-PD/aiter-kernel`。
+将该目录加入 P/D 两端的 `PYTHONPATH`，选择 `--gdn-prefill-backend hcu-aiter`
+并启用上述开关，即可使用原生 HIP/CK Tile recurrence 的 FP32 checkpoint。
+当前支持 gfx936、K=V=128 和转置 state layout。扩展不覆盖系统 AITER 安装包。
 
 ## 执行流程
 
@@ -77,6 +94,15 @@ python tools/analyze_mamba_checkpoint_trace.py TRACE.pt.trace.json.gz \
 forward 的 token 数和 conv / recurrent checkpoint 导出次数。必须同时看到两类
 导出，才能证明 GDN 的两种 state 都走了新路径；仅出现 FLA recurrence 名称不足以
 证明内部 checkpoint 已启用。
+
+上述 `--require-checkpoint` 判断适用于 recurrent state 有独立 copy kernel 的路径。
+外置 BoltOps 直接写 FP32 cache 时会省略 `_store_recurrent_checkpoint`，当前分析器
+不会把普通 recurrence 名称当作导出证据。因此该路径不能依赖这个选项验收；需要
+结合已启用的 checkpoint 参数、目标 cache 内容和续算结果验证。本次独立 kernel
+profile 与相应 correctness 测试位于上文的 `boltops-gdn-chunk-delta-h-optimizer` 目录。
+项目 AITER HIP 扩展的 kernel 有专用名称 `aiter_gdn_checkpoint_kernel`；分析器
+已将它识别为融合的 recurrent export，可与 conv export 一起接受
+`--require-checkpoint` 验证，普通 AITER recurrence 名称不会触发这一判断。
 
 ## 上游来源
 

@@ -34,6 +34,14 @@ This file records third-party source material used by `vllm-plugin-das`. The
 repository is licensed under Apache-2.0; third-party source headers and notices
 are retained in the corresponding local files.
 
+## Optional External BoltOps GDN Checkpoint Kernel
+
+The Python checkpoint hook optionally imports `boltops_gdn_kernel`. The kernel
+implementation, configurations and third-party licenses are maintained in the
+independent `boltops-gdn-kernel` directory, outside this plugin distribution.
+`vllm_hcu/model_executor/layers/boltops_gdn/__init__.py` only forwards the former
+public import path. No BoltOps kernel sources or configs are bundled there.
+
 ## vLLM Upstream Baseline
 
 - Upstream repository: `https://github.com/vllm-project/vllm.git`
