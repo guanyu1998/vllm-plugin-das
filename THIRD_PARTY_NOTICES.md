@@ -2,6 +2,34 @@
 
 SPDX-License-Identifier: Apache-2.0
 
+## FLA Prefill Checkpoint Recurrence
+
+`vllm_hcu/model_executor/layers/fla_prefill_checkpoint.py` adapts
+`vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py` from vLLM
+commit `b5b9f7982c` (Apache-2.0), including the prefill checkpoint API used
+by `29c6cfc457`. Attribution: contributors to the vLLM project; Songlin Yang,
+Yu Zhang. The underlying flash-linear-attention source carries this MIT notice:
+
+Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 This file records third-party source material used by `vllm-plugin-das`. The
 repository is licensed under Apache-2.0; third-party source headers and notices
 are retained in the corresponding local files.
