@@ -108,6 +108,7 @@ export VLLM_USE_V2_MODEL_RUNNER=1
 | --- | --- |
 | `VLLM_USE_V2_MODEL_RUNNER` | 必须选择 V2，HCU Worker 没有旧 runner 回退路径。 |
 | `VLLM_HCU_USE_CUSTOM_OPS` | 默认启用；设为 `0` 关闭受总开关控制的可选 HCU 优化路径，不等于禁用整个插件或移除全部原生依赖。 |
+| `VLLM_HCU_PREFILL_EP_IDLE` | 实验开关，默认 `0`：Qwen4Exp TP1 AgRs P worker 在线空闲轮跳过本地 attention/GDN，保留 MoE 参与。参见[范围与验证](docs/prefill_ep_idle.md)。 |
 
 HCU 专用开关参见 [环境配置](vllm_hcu/platforms/envs.py)。
 Attention/MoE 后端、KV cache 格式、推测解码及并行拓扑应按对应模型配置选择，

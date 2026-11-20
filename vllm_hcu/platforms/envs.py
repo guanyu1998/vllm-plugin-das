@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
     VLLM_HCU_DP_INT8_ALLGATHER: bool = False
+    VLLM_HCU_PREFILL_EP_IDLE: bool = False
     VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
     VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
@@ -737,6 +738,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # AllGatherv. ReduceScatterv remains in the model activation dtype.
     "VLLM_HCU_DP_INT8_ALLGATHER":
         dp_int8_allgather_enabled,
+
+    # Online P-only Qwen4Exp TP1 AgRs dummy: skip local attention/GDN while
+    # preserving the nonempty dummy shape and every EP router/collective call.
+    "VLLM_HCU_PREFILL_EP_IDLE":
+        lambda: optional_custom_op_enabled(
+            _environment_flag(os.environ.get("VLLM_HCU_PREFILL_EP_IDLE", "False"))
+        ),
 
     # Run Qwen4Exp hyper-connection layers sequence-parallel (attention
     # all-gather/reduce-scatter instead of all-reduce) when sequence-parallel

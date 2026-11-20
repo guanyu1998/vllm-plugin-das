@@ -131,6 +131,7 @@ The following settings are not interchangeable:
 | --- | --- |
 | `VLLM_USE_V2_MODEL_RUNNER` | Defaults to `1` on HCU; explicit `0` is rejected. The HCU worker has no legacy-runner fallback. |
 | `VLLM_HCU_USE_CUSTOM_OPS` | Enabled by default; `0` disables optional HCU optimized paths governed by the master switch, not the entire plugin or all native dependencies. |
+| `VLLM_HCU_PREFILL_EP_IDLE` | Experimental, default `0`: skip local attention/GDN in online idle P-worker EP steps for Qwen4Exp TP1 AgRs; retain MoE participation. See [scope and validation](docs/prefill_ep_idle.md). |
 
 See [environment settings](vllm_hcu/platforms/envs.py) for HCU-specific
 switches. Select attention/MoE backends, KV-cache format, speculative decoding,

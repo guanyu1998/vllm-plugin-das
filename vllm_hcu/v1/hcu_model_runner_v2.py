@@ -287,6 +287,16 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             for model in (self.model, self.get_draft_model()):
                 skinny_lm_head.enable_for_model(model)
 
+        from vllm_hcu.v1.prefill_ep_idle import install as install_prefill_ep_idle
+
+        idle_attention_count = install_prefill_ep_idle(self)
+        if idle_attention_count:
+            init_logger("vllm.hcu.runner").info(
+                "Prefill EP idle enabled: %d target/MTP attention modules; "
+                "online idle steps use eager DP agreement",
+                idle_attention_count,
+            )
+
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_rocm_wo_a_layout import (

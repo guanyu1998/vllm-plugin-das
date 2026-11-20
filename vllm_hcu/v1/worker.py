@@ -200,6 +200,12 @@ class HcuGPUWorker(Worker):
 
             refresh_glm53_router_gates(self.model_runner.model)
 
+    def execute_dummy_batch(self) -> None:
+        from vllm_hcu.v1.prefill_ep_idle import online_idle_scope
+
+        with online_idle_scope(self.model_runner):
+            super().execute_dummy_batch()
+
     def compile_or_warm_up_model(self):
         if self.use_v2_model_runner:
             from vllm_hcu.v1.hcu_model_runner_v2 import sampler_warmup_scope
